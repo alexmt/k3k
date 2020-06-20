@@ -1,0 +1,95 @@
+#!/bin/bash
+function freeport() {
+    BASE=9000
+    INCREMENT=1
+
+    port=$BASE
+    isfree=$(netstat -vatn | grep $port)
+
+    while [[ -n "$isfree" ]]; do
+        port=$[port+INCREMENT]
+        isfree=$(netstat -vatn | grep $port)
+    done
+
+    echo "$port"
+}
+
+function cleanup() {
+    $DELETE && {
+        echo "deleting pod ${NAME}"
+        kubectl delete pod ${NAME} > /dev/null 2>&1
+        rm -f /tmp/k3s-${NAME} > /dev/null 2>&1
+        KUBECONFIG=~/.kube/config kubectl config set current-context $RESTORE_CONTEXT > /dev/null 2>&1
+        KUBECONFIG=~/.kube/config kubectl config delete-context k3s-${NAME} > /dev/null 2>&1
+    }
+    
+
+    rm -f $CONFIG_PATH > /dev/null 2>&1
+    exit 0
+}
+
+function download-config() {
+    echo -n "waiting for kube config" &&
+    until kubectl exec -it $NAME ls /etc/rancher/k3s/k3s.yaml > /dev/null 2>&1; do echo -n "." && sleep 1; done && echo "" &&
+    kubectl exec -it $NAME cat /etc/rancher/k3s/k3s.yaml | sed -e "s/127.0.0.1:6443/127.0.0.1:${PORT}/g" > /tmp/k3s-${NAME}.yaml
+}
+
+function merge-config() {
+    KUBECONFIG=/tmp/k3s-${NAME}.yaml kubectl config rename-context default k3s-${NAME} &&
+    KUBECONFIG=/tmp/k3s-${NAME}.yaml:~/.kube/config kubectl config view --merge --flatten > /tmp/merged.yaml &&
+    mv /tmp/merged.yaml ~/.kube/config
+}
+
+function create-pod() {
+    ( kubectl get pod $NAME  > /dev/null 2>&1 && echo "pod '${NAME}' already running") ||
+    (echo "creating pod '${NAME}'" && kubectl create -f - << EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${NAME}
+  labels:
+    k3k: ${NAME}
+spec:
+  containers:
+  - name: k3s
+    image: rancher/k3s:$K3S_VERSION
+    args:
+    - server
+    securityContext:
+      privileged: true
+    ports:
+    - containerPort: 6443
+  restartPolicy: Never
+EOF
+) &&
+    echo -n "waiting for pod" &&
+    while [[ $(kubectl get pods $NAME -o 'jsonpath={..status.conditions[?(@.type=="Ready")].status}') != "True" ]]; do echo -n "." && sleep 1; done && echo ""
+}
+
+NAME=${1:-default}
+K3S_VERSION=${K3S_VERSION:-v1.16.11-k3s1}
+PORT=$(freeport)
+DELETE=false
+
+for i in "$@"
+do
+case $i in
+    --rm)
+    DELETE=true
+    ;;
+esac
+done
+
+CONFIG_PATH=$(mktemp /tmp/foo.XXXXXXXXX)
+kubectl config view --flatten > $CONFIG_PATH
+RESTORE_CONTEXT=$(kubectl config current-context)
+export KUBECONFIG=$CONFIG_PATH
+
+trap cleanup INT
+
+{
+    create-pod &&
+    download-config &&
+    merge-config &&
+    kubectl port-forward $NAME $PORT:6443
+} || cleanup
